@@ -1,26 +1,33 @@
 name: polygate-loop
+run-name: polygate-${{ inputs.subdomain }}-${{ inputs.runner }}
 
-# One half of a self-dispatching relay. A run brings Polygate (the free-model
-# gateway) up on a fresh GitHub runner, publishes it as
-# https://<subdomain>.codol.ir through a Cloudflare Tunnel, keeps it alive for
-# ~5h15m, then dispatches the other half just before the 6-hour job cap.
+# A self-dispatching relay that keeps a Polygate panel online on GitHub runners,
+# under one stable domain.
 #
-#   runner a  --dispatch-->  runner b  --dispatch-->  runner a  --...
+#   runner a --(overlap)--> runner b --(overlap)--> runner a --...
 #
-# The relay runs strictly one at a time (single concurrency group), so the next
-# run is queued while the current one is still serving and starts on a fresh VM
-# the moment this run finishes. The domain never changes, so the dashboard URL
-# and the API base URL stay the same across runners.
+# Timing, per run (defaults):
+#   * one hour of service per run              session_seconds = 3900
+#   * the next run is dispatched 5 minutes     HANDOFF_LEAD_SECONDS = 300
+#     before this one's planned end
+#   * this run stops only AFTER the new run's   "Hand the baton" step
+#     panel is confirmed up
+# So the panel is live continuously, two runners overlap for ~1 minute, and a
+# fresh run appears exactly once an hour.
+#
+# Manual override (quota exhausted, or a fresh runner wanted right now):
+#   dispatch a run from the Actions tab whenever you like - it starts
+#   immediately instead of queueing. It becomes the newest run, so the older
+#   run stops by itself once the new panel is confirmed; cancelling the old run
+#   by hand also works and is safe. A run never starts a third chain: if a newer
+#   run for the same subdomain is already active, it waits for that one and
+#   hands over instead of dispatching its own.
 #
 # Fixed across runs (and the only fixed things):
 #   * the dashboard password        POLYGATE_ADMIN_PASSWORD
 #   * the client API key            POLYGATE_CLIENT_KEY
 # The key value lives in a tiny encrypted seed (POLYGATE_SEED_B64) that is
-# restored on every start. There is no state backup, no snapshot and no export:
-# each runner starts from the seed and is thrown away at the end.
-#
-# Nothing else is persisted. Providers, routes and chains come from the seed and
-# any change made in the dashboard lasts for the current session only.
+# restored on every start. There is no state backup, no snapshot and no export.
 
 on:
   workflow_dispatch:
@@ -36,15 +43,14 @@ on:
         required: false
         default: polygate
       session_seconds:
-        description: "Session length in seconds (GitHub caps a job at 21600 = 6h)"
+        description: "Planned life of this run in seconds; the next one starts 5 min before the end (3900 = hourly)"
         type: string
         required: false
-        default: "18900"
+        default: "3900"
 
-concurrency:
-  group: polygate-loop
-  cancel-in-progress: false
-
+# Deliberately no shared concurrency group: the relay overlaps on purpose and a
+# manual run must start at once instead of waiting in a queue. Duplicate chains
+# are prevented at the handoff, not by the queue.
 permissions:
   contents: read
   actions: write
@@ -52,7 +58,7 @@ permissions:
 jobs:
   gateway:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 100
 
     env:
       # Polygate listens on loopback; cloudflared is the only public entrance.
@@ -61,6 +67,8 @@ jobs:
       SUBDOMAIN_INPUT: ${{ inputs.subdomain }}
       SESSION_INPUT: ${{ inputs.session_seconds }}
       RUNNER_LABEL: ${{ inputs.runner }}
+      NEXT_LABEL: ${{ inputs.runner == 'a' && 'b' || 'a' }}
+      HANDOFF_LEAD_SECONDS: "300"
 
       # 12+ characters, fixed for every run.
       POLYGATE_ADMIN_PASSWORD: ${{ secrets.POLYGATE_ADMIN_PASSWORD }}
@@ -127,38 +135,124 @@ jobs:
       - name: Serve until the handoff
         run: |
           set -euo pipefail
-          SESSION="${SESSION_INPUT:-18900}"
-          TEARDOWN_BUFFER=300
-          DEADLINE=$(( JOB_START + SESSION - TEARDOWN_BUFFER ))
+          SESSION="${SESSION_INPUT:-3900}"
+          LEAD="${HANDOFF_LEAD_SECONDS:-300}"
+          DEADLINE=$(( JOB_START + SESSION - LEAD ))
           SLEEP=$(( DEADLINE - $(date +%s) ))
           if [ "$SLEEP" -lt 0 ]; then SLEEP=0; fi
-          echo "Handoff at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s..."
+          echo "Handoff at $(date -u -d "@$DEADLINE" +%H:%M:%S)Z, sleeping ${SLEEP}s (session ${SESSION}s, lead ${LEAD}s)..."
           sleep "$SLEEP"
 
-      # Queues the other half before this job ends. The concurrency group lets it
-      # start only after this run is gone, so there is never a second gateway on
-      # the same tunnel. Three tries, 20s apart: a transient API error must not
-      # break the chain.
+      # The core of the relay: bring the other half up, wait until its panel is
+      # proven ready, and only then let this run stop.
       - name: Hand the baton to the next runner
+        id: handoff
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ "${RUNNER_LABEL}" = "a" ]; then NEXT=b; else NEXT=a; fi
-          for attempt in 1 2 3; do
+
+          SESSION="${SESSION_INPUT:-3900}"
+          READY_TIMEOUT=480
+          # Stop trying well before the job's own 100-minute kill.
+          RETRY_UNTIL=$(( JOB_START + 5200 ))
+          PREFIX="polygate-$(printf '%s' "${SUBDOMAIN}" | tr 'A-Z' 'a-z')-"
+
+          # Active runs of this workflow for this subdomain only; newest first.
+          list_active() {
+            gh run list --repo "$REPO" --workflow polygate-loop.yml --limit 40 \
+              --json databaseId,createdAt,status,displayTitle \
+              --jq '.[] | select(.status == "queued" or .status == "pending" or .status == "in_progress" or .status == "waiting") | "\(.databaseId) \(.createdAt) \(.displayTitle)"'
+          }
+
+          # The newest active run for this subdomain that is not this one and
+          # was created at or after "$1" (ISO timestamp).
+          find_other() {
+            list_active | awk -v since="$1" -v me="${GITHUB_RUN_ID}" -v pfx="$PREFIX" \
+              '$1 != me && $2 >= since && tolower($3) ~ ("^" pfx) { print $1; exit }'
+          }
+
+          # "<run status> <start-step conclusion>" for a run.
+          step_state() {
+            gh run view "$1" --repo "$REPO" --json status,jobs \
+              --jq '"\(.status) \([.jobs[].steps[]? | select(.name == "Start Polygate and the tunnel")][0].conclusion // "none")"'
+          }
+
+          # True once the run's panel is installed, seeded and its tunnel is up.
+          wait_ready() {
+            local id="$1" end state
+            end=$(( $(date +%s) + READY_TIMEOUT ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+              state=$(step_state "$id" 2>/dev/null || true)
+              case "$state" in
+                *" success") echo "run ${id}: the new panel is up"; return 0 ;;
+                *" failure"|*" cancelled"|*" skipped")
+                  echo "run ${id}: the start step ended with '${state#* }'"; return 1 ;;
+                completed*) echo "run ${id}: finished without a ready panel (${state})"; return 1 ;;
+              esac
+              sleep 10
+            done
+            echo "run ${id}: not ready after ${READY_TIMEOUT}s"
+            return 1
+          }
+
+          handoff_ok=0
+          # Any active run created after this one started is "newer" and wins.
+          MY_START=$(date -u -d "@$JOB_START" +%Y-%m-%dT%H:%M:%SZ)
+
+          # 1. Someone may already be bringing up a newer run (a manual one, or
+          #    another relay): let that one take over instead of starting a third.
+          OTHER=$(find_other "$MY_START")
+          if [ -n "$OTHER" ]; then
+            echo "a newer run (${OTHER}) is already active for ${SUBDOMAIN}; waiting for it"
+            if wait_ready "$OTHER"; then handoff_ok=1; fi
+          fi
+
+          # 2. Otherwise dispatch the other half and wait until its panel answers.
+          attempt=0
+          while [ "$handoff_ok" -eq 0 ] && [ "$(date +%s)" -lt "$RETRY_UNTIL" ]; do
+            attempt=$(( attempt + 1 ))
+            SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            echo "handoff attempt ${attempt}: queueing runner ${NEXT_LABEL}"
             if gh workflow run polygate-loop.yml --repo "$REPO" --ref main \
-                 -f runner="$NEXT" \
-                 -f subdomain="${SUBDOMAIN}" \
-                 -f session_seconds="${SESSION_INPUT:-18900}"; then
-              echo "Queued runner ${NEXT} on ${SUBDOMAIN}.codol.ir (attempt ${attempt})."
-              exit 0
+                 -f runner="$NEXT_LABEL" \
+                 -f subdomain="$SUBDOMAIN" \
+                 -f session_seconds="$SESSION"; then
+              NEW=""
+              for _ in 1 2 3; do
+                NEW=$(find_other "$SINCE")
+                [ -n "$NEW" ] && break
+                sleep 8
+              done
+              if [ -n "$NEW" ] && wait_ready "$NEW"; then handoff_ok=1; fi
             fi
-            echo "dispatch attempt ${attempt} failed; retrying in 20s" >&2
-            sleep 20
+            if [ "$handoff_ok" -eq 0 ]; then
+              echo "attempt ${attempt} did not come up; retrying in 60s"
+              sleep 60
+            fi
           done
-          echo "::error::Could not queue the next run. The watchdog will restart the relay if it is enabled."
-          exit 1
+
+          if [ "$handoff_ok" -eq 1 ]; then
+            # Let the new connector settle before the old one leaves the tunnel.
+            sleep 20
+            echo "the new runner is serving - this one can stop"
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No replacement came up; the watchdog will restart the relay."
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Handoff result
+        if: always() && steps.handoff.outcome != 'skipped'
+        env:
+          HANDOFF_OK: ${{ steps.handoff.outputs.ok }}
+        run: |
+          if [ "${HANDOFF_OK:-0}" = "1" ]; then
+            echo "the next runner was confirmed up before this one stopped"
+          else
+            echo "::warning::no replacement was confirmed; the watchdog will restart the relay"
+          fi
 
       - name: Service log (only when something failed)
         if: failure()
