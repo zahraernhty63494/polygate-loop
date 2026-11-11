@@ -39,4 +39,4 @@ jobs:
           fi
           echo "the relay is down - starting runner a"
           gh workflow run polygate-loop.yml --repo "$REPO" --ref main \
-            -f runner=a -f subdomain=polygate
+            -f runner=a -f subdomain=polygate -f session_seconds=3900
