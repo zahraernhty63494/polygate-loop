@@ -189,14 +189,23 @@ async function ensureTunnelToken() {
     proxied: true,
     ttl: 1,
   };
-  const existing = await cf(`/zones/${zoneId}/dns_records?name=${encodeURIComponent(DOMAIN)}`);
-  if (existing?.length) {
+  const existing =
+    (await cf(`/zones/${zoneId}/dns_records?name=${encodeURIComponent(DOMAIN)}`)) || [];
+  // Two runners overlap for a few minutes during a handoff and share this one
+  // tunnel, so an already-correct CNAME must be left alone: deleting and
+  // re-creating it would flap DNS exactly when the new runner is coming up.
+  const correct = existing.some(
+    (r) => r.type === "CNAME" && r.content === record.content && r.proxied,
+  );
+  if (correct) {
+    log(` Tunnel: DNS ${DOMAIN} -> ${record.content} already correct`);
+  } else {
     for (const r of existing) {
       if (r.id) await cf(`/zones/${zoneId}/dns_records/${r.id}`, { method: "DELETE" }).catch(() => {});
     }
+    await cf(`/zones/${zoneId}/dns_records`, { method: "POST", body: JSON.stringify(record) });
+    log(` Tunnel: DNS ${DOMAIN} -> CNAME ${record.content} (proxied)`);
   }
-  await cf(`/zones/${zoneId}/dns_records`, { method: "POST", body: JSON.stringify(record) });
-  log(` Tunnel: DNS ${DOMAIN} -> CNAME ${record.content} (proxied)`);
 
   return await cf(`/accounts/${accountId}/cfd_tunnel/${tunnel.id}/token`);
 }
